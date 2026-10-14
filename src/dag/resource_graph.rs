@@ -358,6 +358,14 @@ fn resolve_dep_indices(
     vec![]
 }
 
+/// Whether an expression can be evaluated at DAG-build time, where only
+/// variables are known. References to locals, resources or data sources
+/// would evaluate to null, so e.g. `count = length(local.dbs)` came out as
+/// 0 and the resource silently disappeared from the graph.
+fn is_statically_evaluable(expr: &Expression) -> bool {
+    extract_references_from_expression(expr).is_empty()
+}
+
 /// Evaluate the count expression and return the count, or None if no count is set.
 fn evaluate_count(
     resource: &ResourceConfig,
@@ -366,6 +374,14 @@ fn evaluate_count(
     let Some(ref count_expr) = resource.count else {
         return Ok(None);
     };
+    if !is_statically_evaluable(count_expr) {
+        tracing::debug!(
+            "count for {}.{} depends on locals or other resources, treating as single node",
+            resource.resource_type,
+            resource.name
+        );
+        return Ok(None);
+    }
     let ctx = EvalContext::plan_only(var_defaults.clone());
     let val = eval_expression(count_expr, &ctx);
     match val {
@@ -403,6 +419,14 @@ fn evaluate_for_each(
     let Some(ref for_each_expr) = resource.for_each else {
         return Ok(None);
     };
+    if !is_statically_evaluable(for_each_expr) {
+        tracing::debug!(
+            "for_each for {}.{} depends on locals or other resources, treating as single node",
+            resource.resource_type,
+            resource.name
+        );
+        return Ok(None);
+    }
     let ctx = EvalContext::plan_only(var_defaults.clone());
     let val = eval_expression(for_each_expr, &ctx);
     match val {

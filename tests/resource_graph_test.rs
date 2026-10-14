@@ -177,6 +177,82 @@ resource "null_resource" "x" {
     assert!(edges.is_empty(), "{:?}", edges);
 }
 
+// ─── count / for_each that can't be evaluated at graph time ──────────────────
+
+fn node_addresses(graph: &ResourceGraph) -> Vec<String> {
+    graph
+        .node_indices()
+        .map(|i| graph[i].address().to_string())
+        .collect()
+}
+
+#[test]
+fn test_count_from_local_keeps_resource_in_graph() {
+    let (graph, edges) = edges(
+        r#"
+resource "null_resource" "db" {}
+
+locals {
+  dbs = [null_resource.db.id]
+}
+
+resource "null_resource" "prereqs" {
+  count = length(local.dbs)
+}
+"#,
+    );
+    assert!(
+        node_addresses(&graph).contains(&"null_resource.prereqs".to_string()),
+        "{:?}",
+        node_addresses(&graph)
+    );
+    assert!(
+        has_edge(&edges, "null_resource.db", "null_resource.prereqs"),
+        "{:?}",
+        edges
+    );
+}
+
+#[test]
+fn test_for_each_from_local_function_keeps_resource_in_graph() {
+    let (graph, _) = edges(
+        r#"
+resource "null_resource" "db" {}
+
+locals {
+  ids = [null_resource.db.id]
+}
+
+resource "null_resource" "users" {
+  for_each = toset(local.ids)
+}
+"#,
+    );
+    assert!(
+        node_addresses(&graph).contains(&"null_resource.users".to_string()),
+        "{:?}",
+        node_addresses(&graph)
+    );
+}
+
+#[test]
+fn test_count_from_variable_still_expands() {
+    let (graph, _) = edges(
+        r#"
+variable "n" {
+  default = 2
+}
+
+resource "null_resource" "x" {
+  count = var.n
+}
+"#,
+    );
+    let mut addrs = node_addresses(&graph);
+    addrs.sort();
+    assert_eq!(addrs, vec!["null_resource.x[0]", "null_resource.x[1]"]);
+}
+
 // ─── DOT output ──────────────────────────────────────────────────────────────
 
 #[test]
