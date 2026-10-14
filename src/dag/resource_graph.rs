@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -229,11 +229,7 @@ pub fn build_resource_dag(
         }
 
         // Implicit dependencies from expressions, including count/for_each
-        let mut refs = extract_references_from_attributes(&resource.attributes);
-        for meta in [&resource.count, &resource.for_each].into_iter().flatten() {
-            refs.extend(extract_references_from_expression(meta));
-        }
-        let refs = expand_local_references(refs, &local_refs);
+        let refs = resource_references(resource, &local_refs);
         for ref_address in &refs {
             let from_indices = resolve_dep_indices(ref_address, &node_map, &base_to_indices);
             for &from_idx in &from_indices {
@@ -322,6 +318,19 @@ pub fn resolve_local_references(
         visit(name, locals, &mut resolved, &mut visiting);
     }
     resolved
+}
+
+/// Addresses a resource or data source references through its attributes,
+/// count and for_each, with local values expanded.
+fn resource_references(
+    resource: &ResourceConfig,
+    local_refs: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut refs = extract_references_from_attributes(&resource.attributes);
+    for meta in [&resource.count, &resource.for_each].into_iter().flatten() {
+        refs.extend(extract_references_from_expression(meta));
+    }
+    expand_local_references(refs, local_refs)
 }
 
 /// Replace `local.<name>` entries with the addresses that local resolves to.
@@ -491,9 +500,10 @@ fn collect_references(expr: &Expression, refs: &mut Vec<String>) {
                     "data" if parts.len() >= 3 => {
                         refs.push(format!("data.{}.{}", parts[1], parts[2]));
                     }
-                    "module" if parts.len() >= 2 => {
-                        // Module references are tracked but don't resolve to
-                        // individual resource addresses (modules are opaque).
+                    "module" => {
+                        // Modules are opaque: `module.<name>` doesn't resolve to
+                        // resource nodes, but to_dot_with_modules draws it
+                        refs.push(format!("module.{}", parts[1]));
                     }
                     _ => {
                         // resource_type.name pattern
@@ -642,6 +652,7 @@ fn extract_refs_from_interpolation(s: &str, refs: &mut Vec<String>) {
             match type_name {
                 t if skip.contains(&t) => {}
                 "local" => refs.push(format!("local.{}", name)),
+                "module" => refs.push(format!("module.{}", name)),
                 "data" if parts.len() >= 3 => {
                     let data_name = parts[2].split('[').next().unwrap_or(parts[2]);
                     refs.push(format!("data.{}.{}", name, data_name));
@@ -751,4 +762,120 @@ pub fn to_dot(graph: &ResourceGraph) -> String {
 
     dot.push_str("}\n");
     dot
+}
+
+/// Like [`to_dot`], but also draws each `module` call as a node. A module is
+/// linked from the resources, data sources and modules its arguments
+/// reference, and to the resources, data sources, outputs and modules that
+/// reference its outputs (directly or through locals). Module contents are
+/// not expanded; this is for visualisation only and does not change the
+/// graph used for plan/apply.
+pub fn to_dot_with_modules(graph: &ResourceGraph, workspace: &WorkspaceConfig) -> String {
+    let mut dot = to_dot(graph);
+    if workspace.modules.is_empty() {
+        return dot;
+    }
+    if let Some(end) = dot.rfind('}') {
+        dot.truncate(end);
+    }
+
+    let local_refs = resolve_local_references(&workspace.locals);
+
+    // DOT ids for every address: graph nodes are n<index>, modules m<index>
+    let mut ids: HashMap<String, Vec<String>> = HashMap::new();
+    for idx in graph.node_indices() {
+        let address = match &graph[idx] {
+            DagNode::Output { name, .. } => format!("output.{}", name),
+            node => node.base_address().to_string(),
+        };
+        ids.entry(address)
+            .or_default()
+            .push(format!("n{}", idx.index()));
+    }
+    for (i, module) in workspace.modules.iter().enumerate() {
+        ids.insert(format!("module.{}", module.name), vec![format!("m{}", i)]);
+    }
+
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut link = |refs: Vec<String>, to: &str, only_modules: bool| {
+        for r in refs {
+            if only_modules && !r.starts_with("module.") {
+                continue;
+            }
+            for from in ids.get(&r).into_iter().flatten() {
+                if from != to {
+                    edges.insert((from.clone(), to.to_string()));
+                }
+            }
+        }
+    };
+
+    // Module nodes, linked from what their arguments reference
+    dot.push('\n');
+    for (i, module) in workspace.modules.iter().enumerate() {
+        dot.push_str(&format!(
+            "  m{} [label=\"module.{}\\n{}\", shape=component, fillcolor=\"#d8b8e8\"];\n",
+            i,
+            module.name,
+            short_module_source(&module.source).replace('"', "\\\"")
+        ));
+        let mut refs = module.depends_on.clone();
+        for expr in module.variables.values() {
+            refs.extend(extract_references_from_expression(expr));
+        }
+        link(
+            expand_local_references(refs, &local_refs),
+            &format!("m{}", i),
+            false,
+        );
+    }
+
+    // Resources, data sources and outputs that use module outputs
+    for idx in graph.node_indices() {
+        let to = format!("n{}", idx.index());
+        let refs = match &graph[idx] {
+            DagNode::Resource { config, .. } | DagNode::DataSource { config, .. } => {
+                let mut refs = resource_references(config, &local_refs);
+                refs.extend(config.depends_on.iter().cloned());
+                refs
+            }
+            DagNode::Output { name, .. } => workspace
+                .outputs
+                .iter()
+                .find(|o| &o.name == name)
+                .map(|o| {
+                    let mut refs = expand_local_references(
+                        extract_references_from_expression(&o.value),
+                        &local_refs,
+                    );
+                    refs.extend(o.depends_on.iter().cloned());
+                    refs
+                })
+                .unwrap_or_default(),
+        };
+        link(refs, &to, true);
+    }
+
+    for (from, to) in &edges {
+        dot.push_str(&format!("  {} -> {} [style=dashed];\n", from, to));
+    }
+    dot.push_str("}\n");
+    dot
+}
+
+/// Shorten a module source for display: `git::https://host/repo.git//path?ref=v1`
+/// becomes `path`; registry and local sources are shown as-is.
+fn short_module_source(source: &str) -> &str {
+    let without_ref = source.split('?').next().unwrap_or(source);
+    match without_ref.find("://") {
+        Some(scheme_end) => match without_ref[scheme_end + 3..].rfind("//") {
+            Some(i) => &without_ref[scheme_end + 3 + i + 2..],
+            None => without_ref
+                .trim_end_matches(".git")
+                .rsplit('/')
+                .next()
+                .unwrap_or(without_ref),
+        },
+        None => without_ref,
+    }
 }

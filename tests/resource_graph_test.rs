@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use oxid::dag::resource_graph::{build_resource_dag, to_dot, ResourceGraph};
+use oxid::dag::resource_graph::{build_resource_dag, to_dot, to_dot_with_modules, ResourceGraph};
 use oxid::executor::engine::{build_provider_map, build_variable_defaults};
 use oxid::hcl::parse_directory;
 
@@ -265,4 +265,119 @@ fn test_dot_data_source_label_has_single_prefix() {
         dot
     );
     assert!(!dot.contains("data.data."), "{}", dot);
+}
+
+// ─── Module nodes in DOT output ───────────────────────────────────────────────
+
+/// Render `main.tf` with module nodes and return DOT edges as label pairs.
+fn module_dot_edges(tf: &str) -> (String, HashSet<(String, String)>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.tf"), tf).unwrap();
+    let ws = parse_directory(dir.path()).unwrap();
+    let (graph, _) =
+        build_resource_dag(&ws, &build_provider_map(&ws), &build_variable_defaults(&ws)).unwrap();
+    let dot = to_dot_with_modules(&graph, &ws);
+
+    // id -> first line of label
+    let mut labels = std::collections::HashMap::new();
+    for line in dot.lines() {
+        let line = line.trim();
+        if let Some((id, rest)) = line.split_once(" [label=\"") {
+            let label = rest.split(['\\', '"']).next().unwrap();
+            labels.insert(id.to_string(), label.to_string());
+        }
+    }
+    let edges = dot
+        .lines()
+        .filter_map(|l| l.trim().split_once(" -> "))
+        .map(|(from, rest)| {
+            let to = rest.split_whitespace().next().unwrap();
+            (labels[from].clone(), labels[to].clone())
+        })
+        .collect();
+    (dot, edges)
+}
+
+const MODULE_CONFIG: &str = r#"
+data "null_data_source" "subnet" {}
+
+locals {
+  subnet_id = data.null_data_source.subnet.id
+  db_ids    = [for db in module.db : db.id]
+}
+
+module "db" {
+  source    = "git::https://example.com/modules.git//database?ref=v1.2.0"
+  count     = 2
+  subnet_id = local.subnet_id
+}
+
+module "monitoring" {
+  source   = "./modules/monitoring"
+  db_ids   = local.db_ids
+}
+
+resource "null_resource" "prereqs" {
+  count    = length(local.db_ids)
+  triggers = {
+    ids = join(",", local.db_ids)
+  }
+}
+
+output "db" {
+  value = module.db[0].id
+}
+"#;
+
+#[test]
+fn test_module_node_rendered_with_short_source() {
+    let (dot, _) = module_dot_edges(MODULE_CONFIG);
+    assert!(dot.contains("label=\"module.db\\ndatabase\""), "{}", dot);
+    assert!(
+        dot.contains("label=\"module.monitoring\\n./modules/monitoring\""),
+        "{}",
+        dot
+    );
+    assert!(dot.contains("shape=component"), "{}", dot);
+}
+
+#[test]
+fn test_module_inputs_and_consumers_are_linked() {
+    let (_, edges) = module_dot_edges(MODULE_CONFIG);
+    let has = |from: &str, to: &str| edges.contains(&(from.to_string(), to.to_string()));
+    // input through a local
+    assert!(
+        has("data.null_data_source.subnet", "module.db"),
+        "{:?}",
+        edges
+    );
+    // module -> module through a local
+    assert!(has("module.db", "module.monitoring"), "{:?}", edges);
+    // resource whose count and attributes use module outputs through a local
+    assert!(has("module.db", "null_resource.prereqs"), "{:?}", edges);
+    // output using a module output directly
+    assert!(has("module.db", "output.db"), "{:?}", edges);
+}
+
+#[test]
+fn test_module_references_do_not_change_execution_graph() {
+    // to_dot (and plan/apply) must not gain module nodes
+    let (graph, _) = edges(MODULE_CONFIG);
+    let dot = to_dot(&graph);
+    assert!(!dot.contains("module."), "{}", dot);
+}
+
+#[test]
+fn test_no_modules_matches_to_dot() {
+    let tf = r#"
+resource "null_resource" "a" {}
+resource "null_resource" "b" {
+  name = null_resource.a.id
+}
+"#;
+    let (graph, _) = edges(tf);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.tf"), tf).unwrap();
+    let ws = parse_directory(dir.path()).unwrap();
+    assert_eq!(to_dot_with_modules(&graph, &ws), to_dot(&graph));
 }
