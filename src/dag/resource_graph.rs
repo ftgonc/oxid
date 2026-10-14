@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -186,6 +186,10 @@ pub fn build_resource_dag(
         node_map.insert(format!("output.{}", output.name), idx);
     }
 
+    // References each local value resolves to (through other locals),
+    // so `local.x` creates edges to the resources and data sources behind it
+    let local_refs = resolve_local_references(&workspace.locals);
+
     // Add explicit and implicit dependencies
     for resource in workspace
         .resources
@@ -224,8 +228,12 @@ pub fn build_resource_dag(
             }
         }
 
-        // Implicit dependencies from expressions
-        let refs = extract_references_from_attributes(&resource.attributes);
+        // Implicit dependencies from expressions, including count/for_each
+        let mut refs = extract_references_from_attributes(&resource.attributes);
+        for meta in [&resource.count, &resource.for_each].into_iter().flatten() {
+            refs.extend(extract_references_from_expression(meta));
+        }
+        let refs = expand_local_references(refs, &local_refs);
         for ref_address in &refs {
             let from_indices = resolve_dep_indices(ref_address, &node_map, &base_to_indices);
             for &from_idx in &from_indices {
@@ -249,7 +257,10 @@ pub fn build_resource_dag(
                 }
             }
 
-            let refs = extract_references_from_expression(&output.value);
+            let refs = expand_local_references(
+                extract_references_from_expression(&output.value),
+                &local_refs,
+            );
             for ref_address in &refs {
                 let from_indices = resolve_dep_indices(ref_address, &node_map, &base_to_indices);
                 for &from_idx in &from_indices {
@@ -265,6 +276,69 @@ pub fn build_resource_dag(
     }
 
     Ok((graph, node_map))
+}
+
+/// For every local value, collect the resource and data source addresses it
+/// references, following references to other locals transitively. Cycles
+/// between locals are cut rather than reported (Terraform reports them at
+/// evaluation time).
+pub fn resolve_local_references(
+    locals: &HashMap<String, Expression>,
+) -> HashMap<String, Vec<String>> {
+    fn visit(
+        name: &str,
+        locals: &HashMap<String, Expression>,
+        resolved: &mut HashMap<String, Vec<String>>,
+        visiting: &mut HashSet<String>,
+    ) -> Vec<String> {
+        if let Some(refs) = resolved.get(name) {
+            return refs.clone();
+        }
+        let Some(expr) = locals.get(name) else {
+            return Vec::new();
+        };
+        if !visiting.insert(name.to_string()) {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        for r in extract_references_from_expression(expr) {
+            match r.strip_prefix("local.") {
+                Some(other) => out.extend(visit(other, locals, resolved, visiting)),
+                None => out.push(r),
+            }
+        }
+        out.sort();
+        out.dedup();
+
+        visiting.remove(name);
+        resolved.insert(name.to_string(), out.clone());
+        out
+    }
+
+    let mut resolved = HashMap::new();
+    let mut visiting = HashSet::new();
+    for name in locals.keys() {
+        visit(name, locals, &mut resolved, &mut visiting);
+    }
+    resolved
+}
+
+/// Replace `local.<name>` entries with the addresses that local resolves to.
+fn expand_local_references(
+    refs: Vec<String>,
+    local_refs: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        match r.strip_prefix("local.") {
+            Some(name) => out.extend(local_refs.get(name).cloned().unwrap_or_default()),
+            None => out.push(r),
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Resolve a dependency address to node indices. Tries exact match first, then base_address.
@@ -385,9 +459,11 @@ fn collect_references(expr: &Expression, refs: &mut Vec<String>) {
         Expression::Reference(parts) => {
             if parts.len() >= 2 {
                 let first = &parts[0];
-                // Skip "var.", "local.", "each.", "count.", "path.", "terraform."
+                // Skip "var.", "each.", "count.", "path.", "terraform."; keep
+                // "local." so it can be expanded via resolve_local_references
                 match first.as_str() {
-                    "var" | "local" | "each" | "count" | "path" | "terraform" | "self" => {}
+                    "var" | "each" | "count" | "path" | "terraform" | "self" => {}
+                    "local" => refs.push(format!("local.{}", parts[1])),
                     "data" if parts.len() >= 3 => {
                         refs.push(format!("data.{}.{}", parts[1], parts[2]));
                     }
@@ -513,7 +589,6 @@ fn extract_refs_from_interpolation(s: &str, refs: &mut Vec<String>) {
     // We look for sequences of word chars separated by dots that look like resource addresses.
     let skip = [
         "var",
-        "local",
         "each",
         "count",
         "path",
@@ -542,6 +617,7 @@ fn extract_refs_from_interpolation(s: &str, refs: &mut Vec<String>) {
             }
             match type_name {
                 t if skip.contains(&t) => {}
+                "local" => refs.push(format!("local.{}", name)),
                 "data" if parts.len() >= 3 => {
                     let data_name = parts[2].split('[').next().unwrap_or(parts[2]);
                     refs.push(format!("data.{}.{}", name, data_name));
@@ -619,7 +695,7 @@ pub fn to_dot(graph: &ResourceGraph) -> String {
                 address,
                 resource_type,
                 ..
-            } => (format!("data.{}\\n{}", address, resource_type), "#a8c8d8"),
+            } => (format!("{}\\n{}", address, resource_type), "#a8c8d8"),
             DagNode::Output { name, .. } => (format!("output.{}", name), "#d8d8a8"),
         };
         dot.push_str(&format!(
